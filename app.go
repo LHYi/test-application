@@ -3,32 +3,28 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"context"
-	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/hyperledger/fabric-gateway/pkg/client"
-	"github.com/hyperledger/fabric-gateway/pkg/identity"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
+	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/fab"
+	"github.com/hyperledger/fabric-sdk-go/pkg/core/config"
+	"github.com/hyperledger/fabric-sdk-go/pkg/gateway"
 )
 
 // these address should be changed accordingly when implemented in the hardware
 const (
 	// the mspID should be identical to the one used when calling cryptogen to generate credential files
-	mspID = "Org1MSP"
+	// mspID = "Org1MSP"
 	// the path of the certificates
-	cryptoPath  = "../fabric-samples-2.4/test-network/organizations/peerOrganizations/org1.example.com"
-	certPath    = cryptoPath + "/users/User1@org1.example.com/msp/signcerts/User1@org1.example.com-cert.pem"
+	cryptoPath  = "../fabric-samples-2.3/test-network/organizations/peerOrganizations/org1.example.com"
+	certPath    = cryptoPath + "/users/User1@org1.example.com/msp/signcerts/cert.pem"
 	keyPath     = cryptoPath + "/users/User1@org1.example.com/msp/keystore/"
 	tlsCertPath = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
 	// an IP address to access the peer node, it is a localhost address when the network is running in a single machine
@@ -39,50 +35,84 @@ const (
 	// these information have been designed to be entered by the application user
 	networkName  = "mychannel"
 	contractName = "basic"
+	userName     = "appUser"
 )
 
 func main() {
 	err := os.Setenv("DISCOVERY_AS_LOCALHOST", "true")
 	if err != nil {
-		log.Fatalf("Error setting DISCOVERY_AS_LOCALHOST environemnt variable: %v", err)
+		log.Fatalf("Error setting DISCOVERY_AS_LOCALHOST environment variable: %v", err)
 		os.Exit(1)
 	}
 
-	clientConnection := newGrpcConnection()
-	defer clientConnection.Close()
-	// generation of identity files
-	id := newIdentity(mspID)
-	sign := newSign()
+	log.Println("============ Creating wallet ============")
+	wallet, err := gateway.NewFileSystemWallet("wallet")
+	if err != nil {
+		log.Fatalf("Failed to create wallet: %v", err)
+	}
+	log.Println("============ Wallet created ============")
 
-	gateway, err := client.Connect(
-		id,
-		client.WithSign(sign),
-		client.WithClientConnection(clientConnection),
-		// Default timeouts for different gRPC calls
-		client.WithEvaluateTimeout(5*time.Second),
-		client.WithEndorseTimeout(15*time.Second),
-		client.WithSubmitTimeout(5*time.Second),
-		client.WithCommitStatusTimeout(1*time.Minute),
+	if !wallet.Exists(userName) {
+		err = populateWallet(wallet, userName)
+		if err != nil {
+			log.Fatalf("->Failed to populate wallet contents: %v", err)
+		}
+		log.Printf("-> Successfully add user %s to wallet \n", userName)
+	} else {
+		log.Printf("->  User %s already exists", userName)
+	}
+
+	ccpPath := filepath.Join(
+		"..",
+		"fabric-samples-2.3",
+		"test-network",
+		"organizations",
+		"peerOrganizations",
+		"org1.example.com",
+		"connection-org1.yaml",
+	)
+
+	log.Println("============ connecting to gateway ============")
+	gw, err := gateway.Connect(
+		gateway.WithConfig(config.FromFile(filepath.Clean(ccpPath))),
+		gateway.WithIdentity(wallet, userName),
 	)
 	if err != nil {
-		panic(err)
+		log.Fatalf("Failed to connect to gateway: %v", err)
 	}
-	defer gateway.Close()
+	defer gw.Close()
+	log.Println("============ Successfully connected to gateway ============")
 
-	network := gateway.GetNetwork(networkName)
+	network, err := gw.GetNetwork("mychannel")
+	if err != nil {
+		log.Fatalf("Failed to get network: %v", err)
+	}
+	log.Println("============ successfully connected to network", networkName, "============")
+
 	contract := network.GetContract(contractName)
-	fmt.Println("Successfully connected to the network.")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	startChaincodeEventListening(ctx, network)
+	log.Println("============ successfully got contract", contractName, "============")
 
 funcLoop:
 	for {
 		fmt.Println("-> Continue?: [y/n] ")
 		continueConfirm := catchOneInput()
 		if isYes(continueConfirm) {
+			eventID := "Org1[a-zA-Z]+"
+			reg, notifier, err := contract.RegisterEvent(eventID)
+			if err != nil {
+				fmt.Printf("Failed to register contract event: %s", err)
+				return
+			}
+			defer contract.Unregister(reg)
 			invokeFunc(contract)
+			var event *fab.CCEvent
+			select {
+			case event = <-notifier:
+				fmt.Printf("Received chaincode event: %s - %s \n", event.EventName, event.Payload)
+			case <-time.After(time.Second * 1):
+				fmt.Printf("No chaincode event\n")
+			}
+			contract.Unregister(reg)
 		} else if isNo(continueConfirm) {
 			break funcLoop
 		} else {
@@ -90,51 +120,73 @@ funcLoop:
 		}
 	}
 
-	replayChaincodeEvents(ctx, network, 3)
+	// the credentials must be cleaned if you are going to shut down the current network connection
+	// everytime the network is established, new credential files will be generated
+	fmt.Println("-> Clean up?: [y/n] ")
+	cleanUpConfirm := catchOneInput()
+	if isYes(cleanUpConfirm) {
+		cleanUp()
+	}
 }
 
-func startChaincodeEventListening(ctx context.Context, network *client.Network) {
-	fmt.Println("\n*** Start chaincode event listening")
+func populateWallet(wallet *gateway.Wallet, userName string) error {
+	credPath := filepath.Join(
+		"..",
+		"fabric-samples-2.3",
+		"test-network",
+		"organizations",
+		"peerOrganizations",
+		"org1.example.com",
+		"users",
+		"User1@org1.example.com",
+		"msp",
+	)
 
-	events, err := network.ChaincodeEvents(ctx, contractName)
+	certPath := filepath.Join(credPath, "signcerts", "User1@org1.example.com-cert.pem")
+	// read the certificate pem
+	cert, err := ioutil.ReadFile(filepath.Clean(certPath))
 	if err != nil {
-		panic(fmt.Errorf("failed to start chaincode event listening: %w", err))
+		return err
 	}
 
-	go func() {
-		for event := range events {
-			asset := event.Payload
-			fmt.Printf("\n<-- Chaincode event received: %s - %s\n", event.EventName, asset)
-		}
-	}()
-}
-
-func replayChaincodeEvents(ctx context.Context, network *client.Network, startBlock uint64) {
-	fmt.Println("\n*** Start chaincode event replay")
-
-	events, err := network.ChaincodeEvents(ctx, contractName, client.WithStartBlock(startBlock))
+	keyDir := filepath.Join(credPath, "keystore")
+	// there's a single file in this dir containing the private key
+	files, err := ioutil.ReadDir(keyDir)
 	if err != nil {
-		panic(fmt.Errorf("failed to start chaincode event listening: %w", err))
+		return err
+	}
+	if len(files) != 1 {
+		return fmt.Errorf("keystore folder should have contain one file")
+	}
+	keyPath := filepath.Join(keyDir, files[0].Name())
+	key, err := ioutil.ReadFile(filepath.Clean(keyPath))
+	if err != nil {
+		return err
 	}
 
-	for {
-		select {
-		case <-time.After(10 * time.Second):
-			panic(errors.New("timeout waiting for event replay"))
+	identity := gateway.NewX509Identity("Org1MSP", string(cert), string(key))
 
-		case event := <-events:
-			asset := event.Payload
-			fmt.Printf("\n<-- Chaincode event replayed: %s - %s\n", event.EventName, asset)
-
-			if event.EventName == "DeleteAsset" {
-				// Reached the last submitted transaction so return to stop listening for events
-				return
-			}
-		}
-	}
+	return wallet.Put(userName, identity)
 }
 
-func invokeFunc(contract *client.Contract) {
+func cleanUp() {
+	log.Println("-> Cleaning up wallet...")
+	if _, err := os.Stat("wallet"); err == nil {
+		e := os.RemoveAll("wallet")
+		if e != nil {
+			log.Fatal(e)
+		}
+	}
+	if _, err := os.Stat("keystore"); err == nil {
+		e := os.RemoveAll("keystore")
+		if e != nil {
+			log.Fatal(e)
+		}
+	}
+	log.Println("-> Wallet cleaned up successfully")
+}
+
+func invokeFunc(contract *gateway.Contract) {
 	var functionName string
 	var paraNumber int
 	fmt.Println("-> Please enter the name of the smart contract function you want to invoke")
@@ -147,97 +199,18 @@ func invokeFunc(contract *client.Contract) {
 		functionPara = append(functionPara, catchOneInput())
 	}
 	if paraNumber == 0 {
-		result, commit, err := contract.SubmitAsync(functionName, client.WithArguments())
+		result, err := contract.SubmitTransaction(functionName)
 		if err != nil {
 			panic(fmt.Errorf("failed to submit transaction: %w", err))
 		}
-		fmt.Printf("Result: %s \n", result)
-		status, err := commit.Status()
-		if err != nil {
-			panic(err)
-		}
-		if !status.Successful {
-			panic(fmt.Errorf("transaction %s failed to commit with status code %d", status.TransactionID, int32(status.Code)))
-		}
+		fmt.Printf("Result: %s \n", string(result))
 	} else {
-		result, commit, err := contract.SubmitAsync(functionName, client.WithArguments(functionPara...))
+		result, err := contract.SubmitTransaction(functionName, functionPara...)
 		if err != nil {
 			panic(fmt.Errorf("failed to submit transaction: %w", err))
 		}
-		fmt.Printf("Result: %s \n", result)
-		status, err := commit.Status()
-		if err != nil {
-			panic(err)
-		}
-		if !status.Successful {
-			panic(fmt.Errorf("transaction %s failed to commit with status code %d", status.TransactionID, int32(status.Code)))
-		}
+		fmt.Printf("Result: %s \n", string(result))
 	}
-
-}
-
-func newGrpcConnection() *grpc.ClientConn {
-	certificate, err := loadCertificate(tlsCertPath)
-	if err != nil {
-		panic(err)
-	}
-
-	certPool := x509.NewCertPool()
-	certPool.AddCert(certificate)
-	transportCredentials := credentials.NewClientTLSFromCert(certPool, gatewayPeer)
-
-	connection, err := grpc.Dial(peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
-	if err != nil {
-		panic(fmt.Errorf("failed to create gRPC connection: %w", err))
-	}
-
-	return connection
-}
-
-func newIdentity(mspID string) *identity.X509Identity {
-	certificate, err := loadCertificate(certPath)
-	if err != nil {
-		panic(err)
-	}
-
-	id, err := identity.NewX509Identity(mspID, certificate)
-	if err != nil {
-		panic(err)
-	}
-
-	return id
-}
-
-func loadCertificate(filename string) (*x509.Certificate, error) {
-	certificatePEM, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read certificate file: %w", err)
-	}
-	return identity.CertificateFromPEM(certificatePEM)
-}
-
-func newSign() identity.Sign {
-	files, err := ioutil.ReadDir(keyPath)
-	if err != nil {
-		panic(fmt.Errorf("failed to read private key directory: %w", err))
-	}
-	privateKeyPEM, err := ioutil.ReadFile(path.Join(keyPath, files[0].Name()))
-
-	if err != nil {
-		panic(fmt.Errorf("failed to read private key file: %w", err))
-	}
-
-	privateKey, err := identity.PrivateKeyFromPEM(privateKeyPEM)
-	if err != nil {
-		panic(err)
-	}
-
-	sign, err := identity.NewPrivateKeySign(privateKey)
-	if err != nil {
-		panic(err)
-	}
-
-	return sign
 }
 
 func catchOneInput() string {
